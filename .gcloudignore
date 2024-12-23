@@ -1,0 +1,6 @@
+# Ignore the virtual environment folder
+venv/
+
+# Ignore the specific file dummy.xlsx
+dummy_data_collections.xlsx
+dummy_data.xlsx
