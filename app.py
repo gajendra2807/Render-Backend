@@ -13,7 +13,7 @@ import platform
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Set to DEBUG for detailed logs
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[logging.StreamHandler()]
 )
@@ -22,16 +22,17 @@ logger = logging.getLogger(__name__)
 # Initialize Flask app
 app = Flask(__name__)
 
-# Enable CORS for Android app compatibility
+# Enable CORS for all routes and origins
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Initialize Socket.IO with WebSocket and timeout configurations
+# Initialize Socket.IO with WebSocket only
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    ping_timeout=300,  # Longer timeout for mobile connections
-    ping_interval=100,
-    async_mode='eventlet'
+    ping_timeout=300,       # Longer timeout for mobile connections
+    ping_interval=100,      # Ping interval
+    async_mode='eventlet',
+    transports=['websocket']  # Force only WebSocket, skip polling
 )
 
 # Dynamically set FFMPEG path based on OS
@@ -46,11 +47,9 @@ else:
 uploaded_files = []       # For metadata (optional)
 clients_data = {}         # To store chunked uploads per client
 
-
 @app.route('/')
 def index():
     return "Flask-SocketIO server running for Android app audio processing."
-
 
 @socketio.on('connect')
 def handle_connect():
@@ -62,7 +61,6 @@ def handle_connect():
     # Send existing file metadata to the newly connected client (if desired)
     emit('uploaded_files_list', uploaded_files, room=request.sid)
 
-
 @socketio.on('disconnect')
 def handle_disconnect():
     """ Handle client disconnect """
@@ -70,7 +68,6 @@ def handle_disconnect():
     # Optionally preserve client data if needed
     if request.sid in clients_data:
         logger.info(f"Preserving data for {request.sid}")
-
 
 @socketio.on('upload_start')
 def handle_upload_start(data):
@@ -95,7 +92,6 @@ def handle_upload_start(data):
     # Notify the client that the server is ready to receive chunks
     emit('upload_ready', room=request.sid)
 
-
 @socketio.on('upload_chunk')
 def handle_upload_chunk(data):
     """
@@ -115,7 +111,6 @@ def handle_upload_chunk(data):
     except Exception as e:
         logger.error(f"Error processing chunk: {e}")
         emit('error', {'message': f"Chunk processing failed: {str(e)}"}, room=request.sid)
-
 
 @socketio.on('upload_complete')
 def handle_upload_complete():
@@ -148,9 +143,10 @@ def handle_upload_complete():
                 processed_chunks.append(wav_io.getvalue())
 
                 # Send progress updates back to the uploader
-                emit('processing_progress', {'progress': (i / len(audio)) * 100}, room=request.sid)
+                progress = min((i / len(audio)) * 100, 100)
+                emit('processing_progress', {'progress': progress}, room=request.sid)
                 socketio.sleep(0.5)
-            
+
             # Combine processed chunks into one final WAV
             final_wav_data = b"".join(processed_chunks)
             processed_filename = f"processed_{request.sid}.wav"
@@ -168,7 +164,10 @@ def handle_upload_complete():
         logger.error(f"Error processing audio: {e}")
         emit('error', {'message': f"Processing failed: {str(e)}"}, room=request.sid)
 
-
 if __name__ == '__main__':
+    # Enable detailed Socket.IO and Engine.IO logs
+    logging.getLogger('socketio').setLevel(logging.DEBUG)
+    logging.getLogger('engineio').setLevel(logging.DEBUG)
+
     # Run the server on 0.0.0.0:5000 so it can be accessed externally
     socketio.run(app, host='0.0.0.0', port=5000)
