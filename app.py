@@ -2,14 +2,24 @@ import eventlet
 eventlet.monkey_patch()
 
 from flask import Flask, request
-from flask_cors import CORS
 from flask_socketio import SocketIO, emit
-from pydub import AudioSegment
-import io
-import logging
 import os
-import base64
-import platform
+import logging
+
+# Initialize Flask app
+app = Flask(__name__)
+
+# Secure secret key for sessions
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-default-secret-key')  # Replace in production
+
+# Initialize Socket.IO with Eventlet and enable CORS
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",  # Allow all origins for development; restrict in production
+    async_mode='eventlet',
+    logger=True,
+    engineio_logger=True
+)
 
 # Configure logging
 logging.basicConfig(
@@ -19,131 +29,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Flask app
-app = Flask(__name__)
+# Store the uploaded audio file (Base64 encoded) and metadata
+uploaded_audio = {
+    "filename": None,
+    "data": None
+}
 
-# Enable CORS for Android app compatibility
-CORS(app, resources={r"/*": {"origins": "*"}})
-
-# Initialize Socket.IO with WebSocket and timeout configurations
-socketio = SocketIO(
-    app,
-    cors_allowed_origins="*",
-    ping_timeout=300,  # Longer timeout for mobile connections
-    ping_interval=100,
-    async_mode='eventlet'
-)
-
-# Dynamically set FFMPEG path based on OS
-if platform.system() == "Windows":
-    # Windows Development
-    AudioSegment.converter = r"C:\path\to\ffmpeg\bin\ffmpeg.exe"  # Replace with your Windows ffmpeg.exe path
-else:
-    # Linux Deployment
-    AudioSegment.converter = os.getenv('FFMPEG_PATH', '/usr/bin/ffmpeg')  # Linux default path for deployment
-
-# Global variables for managing uploads
-uploaded_files = []
-clients_data = {}
-
-
+# HTTP Route: Server status check
 @app.route('/')
 def index():
-    return "Flask-SocketIO server running for Android app audio processing."
+    return "Socket.IO server is running and WebSocket is supported!"
 
 
+# WebSocket Event: Client connected
 @socketio.on('connect')
 def handle_connect():
     logger.info(f"Client connected: {request.sid}")
-    # Initialize session data
-    clients_data[request.sid] = {"uploads": []}
-
-    # Send existing files to the newly connected client
-    emit('uploaded_files_list', uploaded_files, room=request.sid)
+    emit('message', {'data': 'Connected to server.'})
 
 
+# WebSocket Event: Client disconnected
 @socketio.on('disconnect')
 def handle_disconnect():
     logger.info(f"Client disconnected: {request.sid}")
-    # Optionally preserve session data
-    if request.sid in clients_data:
-        logger.info(f"Preserving data for {request.sid}")
 
 
-@socketio.on('upload_start')
-def handle_upload_start(data):
-    filename = data.get('filename', 'unknown.mp3')
-    logger.info(f"Upload started for file: {filename} from {request.sid}")
+# WebSocket Event: Upload audio file
+@socketio.on('upload_song')
+def handle_upload_song(data):
+    global uploaded_audio
 
-    # Add metadata
-    uploaded_files.append({"filename": filename, "uploader": request.sid})
-
-    # Prepare to receive data
-    if request.sid in clients_data:
-        clients_data[request.sid]["uploads"].append({"filename": filename, "file_data": io.BytesIO()})
-    emit('upload_ready', room=request.sid)
-
-
-@socketio.on('upload_chunk')
-def handle_upload_chunk(data):
     try:
-        # Decode Base64 chunk
-        chunk = base64.b64decode(data) if isinstance(data, str) else data
+        # Get filename and file data from the client
+        filename = data.get('filename', 'audio.mp3')
+        file_data = data.get('file')  # Base64 encoded data
 
-        if request.sid in clients_data and clients_data[request.sid]["uploads"]:
-            file_data = clients_data[request.sid]["uploads"][-1]["file_data"]
-            file_data.write(chunk)
-            logger.info(f"Received chunk from {request.sid}, size: {len(chunk)} bytes")
-        else:
-            logger.warning(f"No upload in progress for {request.sid}")
+        if not filename or not file_data:
+            emit('error', {'message': 'Invalid data format'})
+            return
+
+        # Save the uploaded audio in memory (could be saved to disk if needed)
+        uploaded_audio['filename'] = filename
+        uploaded_audio['data'] = file_data  # Base64 encoded MP3 file
+
+        logger.info(f"Received and stored file: {filename}")
+
+        # Notify all clients about the uploaded song
+        socketio.emit('song_uploaded', {'filename': filename})
+        emit('message', {'data': f"File {filename} uploaded successfully!"})
+
     except Exception as e:
-        logger.error(f"Error processing chunk: {e}")
-        emit('error', {'message': f"Chunk processing failed: {str(e)}"}, room=request.sid)
+        logger.error(f"Error processing upload: {str(e)}")
+        emit('error', {'message': str(e)})
 
 
-@socketio.on('upload_complete')
-def handle_upload_complete():
+# WebSocket Event: Request to play the uploaded song
+@socketio.on('play_song')
+def handle_play_song():
+    global uploaded_audio
+
     try:
-        if request.sid in clients_data and clients_data[request.sid]["uploads"]:
-            logger.info(f"Upload complete for {request.sid}. Processing audio...")
-
-            # Retrieve uploaded data
-            file_data = clients_data[request.sid]["uploads"][-1]["file_data"]
-            file_data.seek(0)
-            mp3_data = file_data.read()
-
-            emit('processing_start', room=request.sid)
-            socketio.sleep(1)
-
-            # Process the audio in chunks
-            audio = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
-            wav_io = io.BytesIO()
-            chunk_size = 10 * 1000  # Process 10 seconds at a time
-            processed_chunks = []
-
-            for i in range(0, len(audio), chunk_size):
-                chunk = audio[i:i + chunk_size]
-                chunk.export(wav_io, format="wav")
-                processed_chunks.append(wav_io.getvalue())
-
-                # Send progress updates
-                emit('processing_progress', {'progress': (i / len(audio)) * 100}, room=request.sid)
-                socketio.sleep(0.5)
-
-            # Combine processed chunks
-            final_wav_data = b"".join(processed_chunks)
-            processed_filename = f"processed_{request.sid}.wav"
-
-            emit('processing_complete', {
-                'processed_filename': processed_filename,
-                'data': base64.b64encode(final_wav_data).decode('utf-8')  # Send data as Base64
-            }, room=request.sid)
+        if uploaded_audio['filename'] and uploaded_audio['data']:
+            # Broadcast the song data (Base64) to all connected clients
+            socketio.emit('play_song', {
+                'filename': uploaded_audio['filename'],
+                'file': uploaded_audio['data']  # Base64 encoded data
+            })
+            logger.info(f"Playing song: {uploaded_audio['filename']}")
         else:
-            emit('error', {'message': "No upload in progress"}, room=request.sid)
+            emit('error', {'message': 'No audio file uploaded yet!'})
+
     except Exception as e:
-        logger.error(f"Error processing audio: {e}")
-        emit('error', {'message': f"Processing failed: {str(e)}"}, room=request.sid)
+        logger.error(f"Error playing song: {str(e)}")
+        emit('error', {'message': str(e)})
 
 
+# Entry point for running the server
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000)
+    # Get the port dynamically or default to 5000
+    port = int(os.environ.get('PORT', 5000))
+    # Run the server with Eventlet
+    socketio.run(app, host='0.0.0.0', port=port)
