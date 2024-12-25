@@ -36,15 +36,15 @@ socketio = SocketIO(
 
 # Dynamically set FFMPEG path based on OS
 if platform.system() == "Windows":
-    # Windows Development
-    AudioSegment.converter = r"C:\path\to\ffmpeg\bin\ffmpeg.exe"  # Replace with your Windows ffmpeg.exe path
+    # Windows development example (replace with your local ffmpeg.exe path)
+    AudioSegment.converter = r"C:\path\to\ffmpeg\bin\ffmpeg.exe"
 else:
-    # Linux Deployment
-    AudioSegment.converter = os.getenv('FFMPEG_PATH', '/usr/bin/ffmpeg')  # Linux default path for deployment
+    # Linux deployment example
+    AudioSegment.converter = os.getenv('FFMPEG_PATH', '/usr/bin/ffmpeg')
 
 # Global variables for managing uploads
-uploaded_files = []
-clients_data = {}
+uploaded_files = []       # For metadata (optional)
+clients_data = {}         # To store chunked uploads per client
 
 
 @app.route('/')
@@ -54,38 +54,54 @@ def index():
 
 @socketio.on('connect')
 def handle_connect():
+    """ Handle a new client connection """
     logger.info(f"Client connected: {request.sid}")
-    # Initialize session data
+    # Initialize data structure for this client's uploads
     clients_data[request.sid] = {"uploads": []}
 
-    # Send existing files to the newly connected client
+    # Send existing file metadata to the newly connected client (if desired)
     emit('uploaded_files_list', uploaded_files, room=request.sid)
 
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    """ Handle client disconnect """
     logger.info(f"Client disconnected: {request.sid}")
-    # Optionally preserve session data
+    # Optionally preserve client data if needed
     if request.sid in clients_data:
         logger.info(f"Preserving data for {request.sid}")
 
 
 @socketio.on('upload_start')
 def handle_upload_start(data):
+    """
+    Client signals start of upload.
+    data = {
+      "filename": "audio.mp3"  # for example
+    }
+    """
     filename = data.get('filename', 'unknown.mp3')
     logger.info(f"Upload started for file: {filename} from {request.sid}")
 
-    # Add metadata
+    # Keep track of this file in a global list (optional)
     uploaded_files.append({"filename": filename, "uploader": request.sid})
 
-    # Prepare to receive data
+    # Prepare to receive data in clients_data
     if request.sid in clients_data:
-        clients_data[request.sid]["uploads"].append({"filename": filename, "file_data": io.BytesIO()})
+        clients_data[request.sid]["uploads"].append({
+            "filename": filename,
+            "file_data": io.BytesIO()
+        })
+    # Notify the client that the server is ready to receive chunks
     emit('upload_ready', room=request.sid)
 
 
 @socketio.on('upload_chunk')
 def handle_upload_chunk(data):
+    """
+    Client sends a chunk of base64-encoded data.
+    We append it to the current file's BytesIO buffer.
+    """
     try:
         # Decode Base64 chunk
         chunk = base64.b64decode(data) if isinstance(data, str) else data
@@ -103,6 +119,10 @@ def handle_upload_chunk(data):
 
 @socketio.on('upload_complete')
 def handle_upload_complete():
+    """
+    Client signals that the upload is complete.
+    We then process the received audio file.
+    """
     try:
         if request.sid in clients_data and clients_data[request.sid]["uploads"]:
             logger.info(f"Upload complete for {request.sid}. Processing audio...")
@@ -112,13 +132,14 @@ def handle_upload_complete():
             file_data.seek(0)
             mp3_data = file_data.read()
 
+            # Notify the uploader that we're starting processing
             emit('processing_start', room=request.sid)
-            socketio.sleep(1)
+            socketio.sleep(1)  # Just a short pause for demonstration
 
-            # Process the audio in chunks
+            # Process the audio in chunks (example: converting to WAV)
             audio = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
             wav_io = io.BytesIO()
-            chunk_size = 10 * 1000  # Process 10 seconds at a time
+            chunk_size = 10 * 1000  # 10-second chunks
             processed_chunks = []
 
             for i in range(0, len(audio), chunk_size):
@@ -126,18 +147,21 @@ def handle_upload_complete():
                 chunk.export(wav_io, format="wav")
                 processed_chunks.append(wav_io.getvalue())
 
-                # Send progress updates
+                # Send progress updates back to the uploader
                 emit('processing_progress', {'progress': (i / len(audio)) * 100}, room=request.sid)
                 socketio.sleep(0.5)
-
-            # Combine processed chunks
+            
+            # Combine processed chunks into one final WAV
             final_wav_data = b"".join(processed_chunks)
             processed_filename = f"processed_{request.sid}.wav"
 
+            # Broadcast the processed audio to ALL clients
             emit('processing_complete', {
                 'processed_filename': processed_filename,
-                'data': base64.b64encode(final_wav_data).decode('utf-8')  # Send data as Base64
-            }, room=request.sid)
+                'uploader': request.sid,
+                'data': base64.b64encode(final_wav_data).decode('utf-8')
+            }, broadcast=True)
+
         else:
             emit('error', {'message': "No upload in progress"}, room=request.sid)
     except Exception as e:
@@ -146,4 +170,5 @@ def handle_upload_complete():
 
 
 if __name__ == '__main__':
+    # Run the server on 0.0.0.0:5000 so it can be accessed externally
     socketio.run(app, host='0.0.0.0', port=5000)
